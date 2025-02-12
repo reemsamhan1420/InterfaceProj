@@ -1,0 +1,177 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+
+// Motor pins
+#define IN1 13
+#define IN2 12
+#define IN3 14
+#define IN4 27
+#define ENA 26
+#define ENB 25
+
+// IR sensor pins
+#define IR_LEFT 34
+#define IR_RIGHT 35
+
+// Encoder pins
+#define ENCA_A 4
+#define ENCA_B 18
+#define ENCB_A 19
+#define ENCB_B 23
+
+// LiDAR
+VL53L0X lidar;
+#define LIDAR_DISTANCE_THRESHOLD 9
+
+// Encoder variables
+volatile long pulseCountA = 0;
+volatile long pulseCountB = 0;
+
+// PID control variables
+float Kp = 0.35, Ki = 0.4, Kd = 0.5;
+float previousError = 0, integral = 0;
+
+// Maze size
+#define MAZE_SIZE 8
+int floodFillMaze[MAZE_SIZE][MAZE_SIZE];
+
+// Function prototypes
+void setup();
+void loop();
+void moveForwardPID(long speed);
+void turnLeft();
+void turnRight();
+void initializeFloodFill();
+void computeFloodFill(int goalX, int goalY);
+void printFloodFill();
+void moveRobot(int startX, int startY, int goalX, int goalY);
+void updateEncoders();
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  lidar.init();
+  lidar.setTimeout(500);
+  lidar.startContinuous();
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  pinMode(ENCA_A, INPUT);
+  pinMode(ENCA_B, INPUT);
+  pinMode(ENCB_A, INPUT);
+  pinMode(ENCB_B, INPUT);
+
+  initializeFloodFill();
+  computeFloodFill(4, 4);
+  printFloodFill();
+  moveRobot(0, 0, 4, 4);
+}
+
+void loop() {
+  updateEncoders();
+  long distance = lidar.readRangeContinuousMillimeters() / 10.0;
+  if (distance < LIDAR_DISTANCE_THRESHOLD) {
+    moveForwardPID(50); // Slow down
+    if (digitalRead(IR_LEFT) == LOW) {
+      turnRight();
+    } else {
+      turnLeft();
+    }
+    moveForwardPID(90); // Speed back to normal
+  } else {
+    moveForwardPID(90);
+  }
+}
+
+void initializeFloodFill() {
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    for (int j = 0; j < MAZE_SIZE; j++) {
+      floodFillMaze[i][j] = 255; // High value represents unvisited cells
+    }
+  }
+}
+
+void computeFloodFill(int goalX, int goalY) {
+  floodFillMaze[goalX][goalY] = 0;
+  for (int value = 1; value < MAZE_SIZE * MAZE_SIZE; value++) {
+    for (int i = 0; i < MAZE_SIZE; i++) {
+      for (int j = 0; j < MAZE_SIZE; j++) {
+        if (floodFillMaze[i][j] == value - 1) {
+          if (i > 0 && floodFillMaze[i - 1][j] == 255) floodFillMaze[i - 1][j] = value;
+          if (i < MAZE_SIZE - 1 && floodFillMaze[i + 1][j] == 255) floodFillMaze[i + 1][j] = value;
+          if (j > 0 && floodFillMaze[i][j - 1] == 255) floodFillMaze[i][j - 1] = value;
+          if (j < MAZE_SIZE - 1 && floodFillMaze[i][j + 1] == 255) floodFillMaze[i][j + 1] = value;
+        }
+      }
+    }
+  }
+}
+
+void printFloodFill() {
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    for (int j = 0; j < MAZE_SIZE; j++) {
+      Serial.print(floodFillMaze[i][j]);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+  Serial.println();
+}
+
+void moveRobot(int startX, int startY, int goalX, int goalY) {
+  Serial.println("Moving robot using flood fill");
+}
+
+void moveForwardPID(long speed) {
+  updateEncoders();
+  long targetSpeed = speed;
+  long error = pulseCountA - pulseCountB;
+  integral += error;
+  long derivative = error - previousError;
+  long adjustment = Kp * error + Ki * integral + Kd * derivative;
+
+  long leftSpeed = targetSpeed - adjustment;
+  long rightSpeed = targetSpeed + adjustment;
+
+  leftSpeed = constrain(leftSpeed, 50, 255);
+  rightSpeed = constrain(rightSpeed, 50, 255);
+
+  analogWrite(ENA, leftSpeed);
+  analogWrite(ENB, rightSpeed);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  previousError = error;
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  delay(600);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  delay(600);
+}
+
+void updateEncoders() {
+  pulseCountA = digitalRead(ENCA_A);
+  pulseCountB = digitalRead(ENCB_A);
+}
