@@ -1,0 +1,295 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+
+// -------------------- PIN DEFINITIONS --------------------
+
+// Motor pins
+#define IN1 13
+#define IN2 12
+#define IN3 14
+#define IN4 27
+#define ENA 26
+#define ENB 25
+
+// IR sensor pins
+#define IR_LEFT 34
+#define IR_RIGHT 35
+
+// Encoder pins
+#define ENCA_A 4
+#define ENCA_B 18
+#define ENCB_A 19
+#define ENCB_B 23
+
+// LiDAR sensor
+VL53L0X lidar;
+
+// -------------------- ENCODER VARIABLES --------------------
+volatile long pulseCountA = 0;  // For left encoder
+volatile long pulseCountB = 0;  // For right encoder
+
+// -------------------- PID VARIABLES --------------------
+float Kp = 0.5;  // Proportional gain
+float Ki = 0.0;  // Integral gain
+float Kd = 0.0;  // Derivative gain
+
+float pidIntegral = 0.0;
+float lastError   = 0.0;
+
+unsigned long pidInterval = 50; // Update PID every 50 ms
+unsigned long lastPidTime  = 0; 
+
+int baseSpeed = 90; // Lower base speed => more room for correction (0–255)
+
+// -------------------- FUNCTION PROTOTYPES --------------------
+void IRAM_ATTR encoderAInterrupt();
+void IRAM_ATTR encoderBInterrupt();
+void IRAM_ATTR encoderCInterrupt();
+void IRAM_ATTR encoderDInterrupt();
+
+void moveForwardPID();
+float computePidCorrection();
+void stopMotors();
+void turnLeft();      // ~180° left turn
+void turnRight();     // ~180° right turn
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+
+  // Motor pins setup
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // IR sensors setup
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  // Encoder pins setup
+  pinMode(ENCA_A, INPUT);
+  pinMode(ENCA_B, INPUT);
+  pinMode(ENCB_A, INPUT);
+  pinMode(ENCB_B, INPUT);
+
+  // Attach interrupts for encoders
+  attachInterrupt(digitalPinToInterrupt(ENCA_A), encoderAInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCA_B), encoderBInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCB_A), encoderCInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCB_B), encoderDInterrupt, CHANGE);
+
+  // LiDAR setup
+  Wire.begin();
+  lidar.init();
+  lidar.setTimeout(500);
+
+  // Initialize PID timing
+  lastPidTime = millis();
+  
+  Serial.println("Setup complete. Starting...");
+}
+
+// -------------------- MAIN LOOP --------------------
+void loop() {
+  // Read IR sensors
+  bool irLeft = digitalRead(IR_LEFT);   // Depending on your sensor, HIGH or LOW might mean "detected"
+  bool irRight = digitalRead(IR_RIGHT);
+
+  // LiDAR distance in cm (integer)
+  int distance = lidar.readRangeSingleMillimeters() / 10;
+
+  // Print sensor data for debugging
+  Serial.print("Left IR: ");
+  Serial.print(irLeft);
+  Serial.print(" | Right IR: ");
+  Serial.print(irRight);
+  Serial.print(" | LiDAR Distance: ");
+  Serial.print(distance);
+  Serial.print(" cm | EncA: ");
+  Serial.print(pulseCountA);
+  Serial.print(" | EncB: ");
+  Serial.println(pulseCountB);
+
+  // If obstacle is within ~30 cm (change as needed)
+  if (distance < 9) {
+    stopMotors();
+    delay(500); // Pause briefly
+
+    // Turn logic based on IR sensors
+    // (Assuming IR=HIGH means "Obstacle", adjust if reversed)
+    if (irLeft == HIGH && irRight == LOW) {
+      turnRight();  // ~180° right
+    } 
+    else if (irLeft == LOW && irRight == HIGH) {
+      turnLeft();   // ~180° left
+    } 
+    else {
+      // Default turn
+      turnRight();  
+    }
+    delay(500); 
+    stopMotors(); 
+  } 
+  else {
+    // No obstacle => Move straight under PID control
+    moveForwardPID();
+  }
+}
+
+// -------------------- PID CONTROL FUNCTIONS --------------------
+
+// This function is called periodically to compute the correction
+float computePidCorrection() {
+  // Compute time since last PID
+  unsigned long now = millis();
+  float dt = (float)(now - lastPidTime) / 1000.0; // in seconds
+  lastPidTime = now;
+
+  // Read the current encoder counts
+  long countLeft  = pulseCountA; 
+  long countRight = pulseCountB; 
+
+  // Reset for next interval
+  pulseCountA = 0;  
+  pulseCountB = 0;
+
+  // Error: difference in pulses between left and right
+  float error = (float)(countLeft - countRight);
+
+  // --- Proportional term ---
+  float pTerm = Kp * error;
+
+  // --- Integral term ---
+  pidIntegral += error * dt;
+  float iTerm = Ki * pidIntegral;
+
+  // --- Derivative term ---
+  float derivative = (error - lastError) / dt;
+  float dTerm = Kd * derivative;
+
+  lastError = error;
+
+  // Sum up the terms
+  float correction = pTerm + iTerm + dTerm;
+
+  return correction;
+}
+
+// Move forward with PID correction
+void moveForwardPID() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+
+  // Only compute + apply correction every 'pidInterval' ms
+  if (now - lastCheck >= pidInterval) {
+    lastCheck = now;
+
+    // 1) Get the correction
+    float correction = computePidCorrection();
+
+    // 2) Apply correction to each motor speed
+    //    If your robot curves the wrong way, swap plus/minus
+    float leftSpeed  = baseSpeed - correction;
+    float rightSpeed = baseSpeed + correction;
+
+    // 3) Constrain speeds
+    if (leftSpeed < 0) leftSpeed = 0;
+    if (leftSpeed > 255) leftSpeed = 255;
+    if (rightSpeed < 0) rightSpeed = 0;
+    if (rightSpeed > 255) rightSpeed = 255;
+
+    // 4) Set motor directions for forward
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+
+    // 5) Apply PWM
+    analogWrite(ENA, (int)leftSpeed);
+    analogWrite(ENB, (int)rightSpeed);
+  }
+}
+
+// -------------------- BASIC MOTOR CONTROL --------------------
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+// Turn left ~180°
+void turnLeft() {
+  // Left wheel forward, Right wheel backward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  // Apply PWM
+  analogWrite(ENA, 80);
+  analogWrite(ENB, 80);
+
+  // ~180° turn by time. Adjust as needed.
+  delay(750);
+
+  // Stop after the turn
+  stopMotors();
+}
+
+// Turn right ~180°
+void turnRight() {
+  // Left wheel backward, Right wheel forward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  // Apply PWM
+  analogWrite(ENA, 80);
+  analogWrite(ENB, 80);
+
+  // ~180° turn by time. Adjust as needed.
+  delay(750);
+
+  // Stop after the turn
+  stopMotors();
+}
+
+// -------------------- ENCODER INTERRUPTS --------------------
+void IRAM_ATTR encoderAInterrupt() {
+  if (digitalRead(ENCA_B)) {
+    pulseCountA++;
+  } else {
+    pulseCountA--;
+  }
+}
+
+void IRAM_ATTR encoderBInterrupt() {
+  if (digitalRead(ENCA_A)) {
+    pulseCountA--;
+  } else {
+    pulseCountA++;
+  }
+}
+
+void IRAM_ATTR encoderCInterrupt() {
+  if (digitalRead(ENCB_B)) {
+    pulseCountB++;
+  } else {
+    pulseCountB--;
+  }
+}
+
+void IRAM_ATTR encoderDInterrupt() {
+  if (digitalRead(ENCB_A)) {
+    pulseCountB--;
+  } else {
+    pulseCountB++;
+  }
+}
